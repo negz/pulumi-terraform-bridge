@@ -110,8 +110,12 @@ func Test_GoDefaults(t *testing.T) {
 
 	testVar := func(v *variable, dvt defaultValueTest) {
 		v.info.Default.EnvVars = nil
+		expected := dvt.expectedGo
+		if expected != "" {
+			expected = fmt.Sprintf("pulumi.Any(%s)", expected)
+		}
 		actual := g.goDefaultValue(v)
-		assert.Equal(t, dvt.expectedGo, actual)
+		assert.Equal(t, expected, actual)
 
 		parser, outDefault := "nil", "\"\""
 		switch dvt.schema.Type {
@@ -133,12 +137,12 @@ func Test_GoDefaults(t *testing.T) {
 		}
 
 		v.info.Default.EnvVars = []string{"FOO"}
-		expected := fmt.Sprintf(`getEnvOrDefault(%s, %s, "FOO")`, defaultValue, parser)
+		expected = fmt.Sprintf(`pulumi.Any(getEnvOrDefault(%s, %s, "FOO"))`, defaultValue, parser)
 		actual = g.goDefaultValue(v)
 		assert.Equal(t, expected, actual)
 
 		v.info.Default.EnvVars = []string{"FOO", "BAR"}
-		expected = fmt.Sprintf(`getEnvOrDefault(%s, %s, "FOO", "BAR")`, defaultValue, parser)
+		expected = fmt.Sprintf(`pulumi.Any(getEnvOrDefault(%s, %s, "FOO", "BAR"))`, defaultValue, parser)
 		actual = g.goDefaultValue(v)
 		assert.Equal(t, expected, actual)
 	}

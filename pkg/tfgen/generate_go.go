@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -57,6 +58,149 @@ type goGenerator struct {
 	needsUtils  bool
 }
 
+type goTypeKind int
+
+const (
+	goKindInput  = 1 << 1
+	goKindOutput = 1 << 2
+	goKindPlain  = 1 << 3
+)
+
+type goNestedType struct {
+	declarer declarer
+	kinds    goTypeKind
+	typ      *propertyType
+}
+
+type goNestedTypes struct {
+	memberNames map[string]bool
+	nameToType  map[string]*goNestedType
+	perDeclarer map[declarer][]*goNestedType
+}
+
+// Each nested input type needs an `Input` interface, an inputty type that implements that interface, and a plain
+// type.
+//
+// Each nested output type needs an `Output` type and a plain type. If the output type has a corresponding input
+// type, it does not need to redefine the plain type, and its `Output` type should implement the `Input` inerface.
+//
+// Nested types include array types.
+func gatherGoNestedTypesForModule(mod *module) *goNestedTypes {
+	nt := &goNestedTypes{
+		memberNames: make(map[string]bool),
+		nameToType:  make(map[string]*goNestedType),
+		perDeclarer: make(map[declarer][]*goNestedType),
+	}
+
+	for _, member := range mod.members {
+		nt.memberNames[member.Name()] = true
+	}
+
+	for _, member := range mod.members {
+		switch member := member.(type) {
+		case *resourceType:
+			nt.gatherFromProperties(member, member.name, "", member.inprops, goKindInput|goKindOutput|goKindPlain)
+			nt.gatherFromProperties(member, member.name, "", member.outprops, goKindOutput|goKindPlain)
+			if !member.IsProvider() {
+				nt.gatherFromProperties(member, member.name, "", member.statet.properties, goKindInput|goKindOutput|goKindPlain)
+			}
+		case *resourceFunc:
+			name := strings.Title(member.name)
+			nt.gatherFromProperties(member, name, "Args", member.args, goKindPlain)
+			nt.gatherFromProperties(member, name, "Result", member.rets, goKindPlain)
+		case *variable:
+			nt.gatherFromPropertyType(member, member.name, "", "", member.typ, goKindPlain)
+		}
+	}
+
+	return nt
+}
+
+func (nt *goNestedTypes) getDeclaredTypes(declarer declarer) []*goNestedType {
+	return nt.perDeclarer[declarer]
+}
+
+func (nt *goNestedTypes) declareType(
+	declarer declarer, namePrefix, name, nameSuffix string, typ *propertyType, goKinds goTypeKind) string {
+
+	// Generate a name for this nested type.
+	baseName := namePrefix + strings.Title(name)
+
+	// Override the nested type name, if necessary.
+	if typ.nestedType.Name().String() != "" {
+		baseName = typ.nestedType.Name().String()
+	}
+
+	nameSuffix = strings.Title(nameSuffix)
+
+	// If there is already a module member with this name, disambiguate based on the declarer type.
+	typeName := baseName + nameSuffix
+	if nt.memberNames[typeName] {
+		switch declarer.(type) {
+		case *resourceType:
+			typeName = baseName + "Resource" + nameSuffix
+		case *resourceFunc:
+			typeName = baseName + "Func" + nameSuffix
+		case *variable:
+			typeName = baseName + "Var" + nameSuffix
+		}
+	}
+
+	typ.name = typeName
+
+	if existing := nt.nameToType[typeName]; existing != nil {
+		if existing.declarer != declarer {
+			contract.Failf("Nested type %q declared by %s was already declared by %s",
+				typeName, existing.declarer.Name(), declarer.Name())
+		}
+		existing.kinds |= goKinds
+		return baseName
+	}
+
+	t := &goNestedType{
+		declarer: declarer,
+		kinds:    goKinds,
+		typ:      typ,
+	}
+
+	nt.nameToType[typeName] = t
+	nt.perDeclarer[declarer] = append(nt.perDeclarer[declarer], t)
+
+	return baseName
+}
+
+func (nt *goNestedTypes) gatherFromProperties(
+	declarer declarer, namePrefix, nameSuffix string, ps []*variable, goKinds goTypeKind) {
+
+	for _, p := range ps {
+		nt.gatherFromPropertyType(declarer, namePrefix, p.name, nameSuffix, p.typ, goKinds)
+	}
+}
+
+func (nt *goNestedTypes) gatherFromPropertyType(
+	declarer declarer, namePrefix, name, nameSuffix string, typ *propertyType, goKinds goTypeKind) {
+
+	switch typ.kind {
+	case kindList, kindSet:
+		if typ.element != nil {
+			nt.gatherFromPropertyType(declarer, namePrefix, name, nameSuffix, typ.element, goKinds)
+			if goKinds != goKindPlain && typ.element.kind == kindObject {
+				nt.declareType(declarer, "", typ.element.name+"Array", nameSuffix, typ, goKinds)
+			}
+		}
+	case kindMap:
+		if typ.element != nil {
+			nt.gatherFromPropertyType(declarer, namePrefix, name, nameSuffix, typ.element, goKinds)
+			if goKinds != goKindPlain && typ.element.kind == kindObject {
+				nt.declareType(declarer, "", typ.element.name+"Map", nameSuffix, typ, goKinds)
+			}
+		}
+	case kindObject:
+		baseName := nt.declareType(declarer, namePrefix, name, nameSuffix, typ, goKinds)
+		nt.gatherFromProperties(declarer, baseName, nameSuffix, typ.properties, goKinds)
+	}
+}
+
 // commentChars returns the comment characters to use for single-line comments.
 func (g *goGenerator) commentChars() string {
 	return "//"
@@ -72,9 +216,10 @@ func (g *goGenerator) moduleDir(mod *module) string {
 }
 
 type imports struct {
-	Errors bool // true to import github.com/pkg/errors.
-	Pulumi bool // true to import github.com/pulumi/pulumi/sdk/go/pulumi.
-	Config bool // true to import github.com/pulumi/pulumi/sdk/go/pulumi/config.
+	Errors         bool // true to import github.com/pkg/errors.
+	Pulumi         bool // true to import github.com/pulumi/pulumi/sdk/go/pulumi.
+	Config         bool // true to import github.com/pulumi/pulumi/sdk/go/pulumi/config.
+	ReflectContext bool // true to import reflect and context.
 }
 
 // openWriter opens a writer for the given module and file name, emitting the standard header automatically.
@@ -109,8 +254,12 @@ func (g *goGenerator) goPackageName(mod *module) string {
 }
 
 func (g *goGenerator) emitImports(w *tools.GenWriter, ims imports) {
-	if ims.Errors || ims.Pulumi || ims.Config {
+	if ims.Errors || ims.Pulumi || ims.Config || ims.ReflectContext {
 		w.Writefmtln("import (")
+		if ims.ReflectContext {
+			w.Writefmtln("\t\"context\"")
+			w.Writefmtln("\t\"reflect\"")
+		}
 		if ims.Errors {
 			w.Writefmtln("\t\"github.com/pkg/errors\"")
 		}
@@ -127,6 +276,12 @@ func (g *goGenerator) emitImports(w *tools.GenWriter, ims imports) {
 
 // emitPackage emits an entire package pack into the configured output directory with the configured settings.
 func (g *goGenerator) emitPackage(pack *pkg) error {
+	// Ensure that we have a root module.
+	root := pack.modules.ensureModule("")
+	if pack.provider != nil {
+		root.members = append(root.members, pack.provider)
+	}
+
 	// Generate individual modules and their contents as packages.
 	if err := g.emitModules(pack.modules); err != nil {
 		return err
@@ -170,6 +325,9 @@ func (g *goGenerator) emitModule(mod *module) error {
 		return errors.Wrapf(err, "creating module directory")
 	}
 
+	// Gather the nested types for this module.
+	nested := gatherGoNestedTypesForModule(mod)
+
 	// Ensure that the module has a module-wide comment.
 	if err := g.ensurePackageComment(mod, dir); err != nil {
 		return errors.Wrapf(err, "creating module comment file")
@@ -177,12 +335,14 @@ func (g *goGenerator) emitModule(mod *module) error {
 
 	// Now, enumerate each module member, in the order presented to us, and do the right thing.
 	for _, member := range mod.members {
-		if err := g.emitModuleMember(mod, member); err != nil {
+		if err := g.emitModuleMember(mod, member, nested); err != nil {
 			return errors.Wrapf(err, "emitting module %s member %s", mod.name, member.Name())
 		}
 	}
 
 	// If this is a config module, we need to emit the configuration variables.
+	//
+	// TODO(pdg): emit nested config types
 	if mod.config() {
 		if err := g.emitConfigVariables(mod); err != nil {
 			return errors.Wrapf(err, "emitting config module variables")
@@ -235,14 +395,14 @@ func (g *goGenerator) ensurePackageComment(mod *module, dir string) error {
 }
 
 // emitModuleMember emits the given member into its own file.
-func (g *goGenerator) emitModuleMember(mod *module, member moduleMember) error {
+func (g *goGenerator) emitModuleMember(mod *module, member moduleMember, nested *goNestedTypes) error {
 	glog.V(3).Infof("emitModuleMember(%s, %s)", mod, member.Name())
 
 	switch t := member.(type) {
 	case *resourceType:
-		return g.emitResourceType(mod, t)
+		return g.emitResourceType(mod, t, nested)
 	case *resourceFunc:
-		return g.emitResourceFunc(mod, t)
+		return g.emitResourceFunc(mod, t, nested)
 	case *variable:
 		contract.Assertf(mod.config(),
 			"only expected top-level variables in config module (%s is not one)", mod.name)
@@ -392,208 +552,236 @@ func (g *goGenerator) emitRawDocComment(w *tools.GenWriter, comment, prefix stri
 	}
 }
 
-func (g *goGenerator) emitPlainOldType(w *tools.GenWriter, pot *propertyType) {
-	if pot.doc != "" {
-		g.emitDocComment(w, pot.doc, "", "")
-	}
-	w.Writefmtln("type %s struct {", pot.name)
-	for _, prop := range pot.properties {
-		if prop.doc != "" && prop.doc != elidedDocComment {
-			g.emitDocComment(w, prop.doc, prop.docURL, "\t")
-		} else if prop.rawdoc != "" {
-			g.emitRawDocComment(w, prop.rawdoc, "\t")
-		}
-		w.Writefmtln("\t%s interface{}", upperFirst(prop.name))
-	}
-	w.Writefmtln("}")
+type goResourceGenerator struct {
+	g *goGenerator
+
+	mod    *module
+	res    *resourceType
+	fun    *resourceFunc
+	nested []*goNestedType
+
+	name string
+	w    *tools.GenWriter
 }
 
-func (g *goGenerator) emitResourceType(mod *module, res *resourceType) error {
-	// See if we'll be generating an error.  If yes, we need to import.
-	var importErrors bool
-	ins := make(map[string]bool)
-	for _, prop := range res.inprops {
-		ins[prop.name] = true
-		if !prop.optional() {
-			importErrors = true
-		}
-	}
+func newGoResourceGenerator(g *goGenerator, mod *module, res *resourceType,
+	nested *goNestedTypes) *goResourceGenerator {
 
-	// Create a resource module file into which all of this resource's types will go.
-	name := res.name
-	w, err := g.openWriter(mod, lowerFirst(name)+".go", imports{Pulumi: true, Errors: importErrors})
+	return &goResourceGenerator{
+		g:      g,
+		mod:    mod,
+		res:    res,
+		nested: nested.getDeclaredTypes(res),
+		name:   res.name,
+	}
+}
+
+func newGoDatasourceGenerator(g *goGenerator, mod *module, fun *resourceFunc,
+	nested *goNestedTypes) *goResourceGenerator {
+
+	return &goResourceGenerator{
+		g:      g,
+		mod:    mod,
+		fun:    fun,
+		nested: nested.getDeclaredTypes(fun),
+		name:   fun.name,
+	}
+}
+
+func (rg *goResourceGenerator) emit() error {
+	// Create a resource source file into which all of this resource's types will go.
+	imps := rg.getImports()
+	w, err := rg.g.openWriter(rg.mod, lowerFirst(rg.name)+".go", imps)
 	if err != nil {
 		return err
 	}
 	defer contract.IgnoreClose(w)
+	rg.w = w
 
-	// Ensure that we've emitted any custom imports pertaining to any of the field types.
-	var fldinfos []*tfbridge.SchemaInfo
-	for _, fldinfo := range res.info.Fields {
-		fldinfos = append(fldinfos, fldinfo)
-	}
-	if err = g.emitCustomImports(w, mod, fldinfos); err != nil {
-		return err
-	}
-
-	// Define the resource type structure, just a basic wrapper around the resource registration information.
-	if res.doc != "" {
-		g.emitDocComment(w, res.doc, res.docURL, "")
-	}
-	if !res.IsProvider() {
-		if res.info.DeprecationMessage != "" {
-			w.Writefmtln("// Deprecated: %s", res.info.DeprecationMessage)
+	if rg.res != nil {
+		if err = rg.generateResourceType(); err != nil {
+			return err
+		}
+	} else {
+		contract.Assert(rg.fun != nil)
+		if err = rg.generateDatasourceFunc(); err != nil {
+			return err
 		}
 	}
-	w.Writefmtln("type %s struct {", name)
-	w.Writefmtln("\ts *pulumi.ResourceState")
-	w.Writefmtln("}")
-	w.Writefmtln("")
-
-	// Create a constructor function that registers a new instance of this resource.
-	argsType := res.argst.name
-	w.Writefmtln("// New%s registers a new resource with the given unique name, arguments, and options.", name)
-	if res.info.DeprecationMessage != "" {
-		w.Writefmtln("// Deprecated: %s", res.info.DeprecationMessage)
-	}
-	w.Writefmtln("func New%s(ctx *pulumi.Context,", name)
-	w.Writefmtln("\tname string, args *%s, opts ...pulumi.ResourceOpt) (*%s, error) {", argsType, name)
-
-	// Ensure required arguments are present.
-	for _, prop := range res.inprops {
-		if !prop.optional() {
-			w.Writefmtln("\tif args == nil || args.%s == nil {", upperFirst(prop.name))
-			w.Writefmtln("\t\treturn nil, errors.New(\"missing required argument '%s'\")", upperFirst(prop.name))
-			w.Writefmtln("\t}")
-		}
-	}
-
-	// Produce the input map.
-	w.Writefmtln("\tinputs := make(map[string]interface{})")
-	hasDefault := make(map[*variable]bool)
-	for _, prop := range res.inprops {
-		if defaultValue := g.goDefaultValue(prop); defaultValue != "" {
-			hasDefault[prop] = true
-			w.Writefmtln("\tinputs[\"%s\"] = %s", prop.name, defaultValue)
-		}
-	}
-	w.Writefmtln("\tif args == nil {")
-	for _, prop := range res.inprops {
-		if !hasDefault[prop] {
-			w.Writefmtln("\t\tinputs[\"%s\"] = nil", prop.name)
-		}
-	}
-	w.Writefmtln("\t} else {")
-	for _, prop := range res.inprops {
-		w.Writefmtln("\t\tinputs[\"%s\"] = args.%s", prop.name, upperFirst(prop.name))
-	}
-	w.Writefmtln("\t}")
-	for _, prop := range res.outprops {
-		if !ins[prop.name] {
-			w.Writefmtln("\tinputs[\"%s\"] = nil", prop.name)
-		}
-	}
-
-	// Finally make the call to registration.
-	w.Writefmtln("\ts, err := ctx.RegisterResource(\"%s\", name, true, inputs, opts...)", res.info.Tok)
-	w.Writefmtln("\tif err != nil {")
-	w.Writefmtln("\t\treturn nil, err")
-	w.Writefmtln("\t}")
-	w.Writefmtln("\treturn &%s{s: s}, nil", name)
-	w.Writefmtln("}")
-	w.Writefmtln("")
-
-	// Emit a factory function that reads existing instances of this resource.
-	stateType := res.statet.name
-	w.Writefmtln("// Get%[1]s gets an existing %[1]s resource's state with the given name, ID, and optional", name)
-	w.Writefmtln("// state properties that are used to uniquely qualify the lookup (nil if not required).")
-	if res.info.DeprecationMessage != "" {
-		w.Writefmtln("// Deprecated: %s", res.info.DeprecationMessage)
-	}
-	w.Writefmtln("func Get%s(ctx *pulumi.Context,", name)
-	w.Writefmtln("\tname string, id pulumi.ID, state *%s, opts ...pulumi.ResourceOpt) (*%s, error) {", stateType, name)
-	w.Writefmtln("\tinputs := make(map[string]interface{})")
-	w.Writefmtln("\tif state != nil {")
-	for _, prop := range res.outprops {
-		w.Writefmtln("\t\tinputs[\"%s\"] = state.%s", prop.name, upperFirst(prop.name))
-	}
-	w.Writefmtln("\t}")
-	w.Writefmtln("\ts, err := ctx.ReadResource(\"%s\", name, id, inputs, opts...)", res.info.Tok)
-	w.Writefmtln("\tif err != nil {")
-	w.Writefmtln("\t\treturn nil, err")
-	w.Writefmtln("\t}")
-	w.Writefmtln("\treturn &%s{s: s}, nil", name)
-	w.Writefmtln("}")
-	w.Writefmtln("")
-
-	// Create accessors for all of the properties inside of the resulting resource structure.
-	w.Writefmtln("// URN is this resource's unique name assigned by Pulumi.")
-	w.Writefmtln("func (r *%s) URN() pulumi.URNOutput {", name)
-	w.Writefmtln("\treturn r.s.URN()")
-	w.Writefmtln("}")
-	w.Writefmtln("")
-	w.Writefmtln("// ID is this resource's unique identifier assigned by its provider.")
-	w.Writefmtln("func (r *%s) ID() pulumi.IDOutput {", name)
-	w.Writefmtln("\treturn r.s.ID()")
-	w.Writefmtln("}")
-	w.Writefmtln("")
-	for _, prop := range res.outprops {
-		if prop.doc != "" && prop.doc != elidedDocComment {
-			g.emitDocComment(w, prop.doc, prop.docURL, "")
-		} else if prop.rawdoc != "" {
-			g.emitRawDocComment(w, prop.rawdoc, "")
-		}
-
-		outType := goOutputType(prop)
-		w.Writefmtln("func (r *%s) %s() %s {", name, upperFirst(prop.name), outType)
-		if outType == defaultGoOutType {
-			w.Writefmtln("\treturn r.s.State[\"%s\"]", prop.name)
-		} else {
-			// If not the default type, we need a cast.
-			w.Writefmtln("\treturn (%s)(r.s.State[\"%s\"])", outType, prop.name)
-		}
-		w.Writefmtln("}")
-		w.Writefmtln("")
-	}
-
-	// Emit the state type for get methods.
-	g.emitPlainOldType(w, res.statet)
-	w.Writefmtln("")
-
-	// Emit the argument type for construction.
-	g.emitPlainOldType(w, res.argst)
+	rg.generateNestedTypes()
 
 	return nil
 }
 
-func (g *goGenerator) emitResourceFunc(mod *module, fun *resourceFunc) error {
-	// Create a vars.ts file into which all configuration variables will go.
-	w, err := g.openWriter(mod, fun.name+".go", imports{Pulumi: true})
-	if err != nil {
-		return err
+func (rg *goResourceGenerator) getImports() imports {
+	imps := imports{Pulumi: true}
+
+	// If we have any nested input or output types, we need to import reflect.
+	for _, nt := range rg.nested {
+		if nt.kinds&(goKindInput|goKindOutput) != 0 {
+			imps.ReflectContext = true
+			break
+		}
 	}
-	defer contract.IgnoreClose(w)
+
+	// See if we'll be generating an error. If yes, we need to import.
+	if rg.res != nil {
+		for _, prop := range rg.res.inprops {
+			if !prop.optional() {
+				imps.Errors = true
+				break
+			}
+		}
+	}
+
+	return imps
+}
+
+func (rg *goResourceGenerator) generateResourceType() error {
+	name := rg.res.name
 
 	// Ensure that we've emitted any custom imports pertaining to any of the field types.
 	var fldinfos []*tfbridge.SchemaInfo
-	for _, fldinfo := range fun.info.Fields {
+	for _, fldinfo := range rg.res.info.Fields {
 		fldinfos = append(fldinfos, fldinfo)
 	}
-	if err := g.emitCustomImports(w, mod, fldinfos); err != nil {
+	if err := rg.g.emitCustomImports(rg.w, rg.mod, fldinfos); err != nil {
+		return err
+	}
+
+	// Define the resource type structure, just a basic wrapper around the resource registration information.
+	if rg.res.doc != "" {
+		rg.g.emitDocComment(rg.w, rg.res.doc, rg.res.docURL, "")
+	}
+	if !rg.res.IsProvider() {
+		if rg.res.info.DeprecationMessage != "" {
+			rg.w.Writefmtln("// Deprecated: %s", rg.res.info.DeprecationMessage)
+		}
+	}
+	rg.w.Writefmtln("type %s struct {", name)
+	if rg.res.IsProvider() {
+		rg.w.Writefmtln("\tpulumi.ProviderResourceState")
+	} else {
+		rg.w.Writefmtln("\tpulumi.CustomResourceState")
+	}
+	for _, prop := range rg.res.outprops {
+		rg.w.Writefmtln("")
+
+		if prop.doc != "" && prop.doc != elidedDocComment {
+			rg.g.emitDocComment(rg.w, prop.doc, prop.docURL, "\t")
+		} else if prop.rawdoc != "" {
+			rg.g.emitRawDocComment(rg.w, prop.rawdoc, "\t")
+		}
+
+		outType := goOutputPropertyType(prop)
+		rg.w.Writefmtln("\t%s %s `pulumi:\"%s\"`", upperFirst(prop.name), outType, prop.name)
+	}
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+
+	// Create a constructor function that registers a new instance of this resource.
+	argsType := rg.res.argst.name
+	rg.w.Writefmtln("// New%s registers a new resource with the given unique name, arguments, and options.", name)
+	if rg.res.info.DeprecationMessage != "" {
+		rg.w.Writefmtln("// Deprecated: %s", rg.res.info.DeprecationMessage)
+	}
+	rg.w.Writefmtln("func New%s(ctx *pulumi.Context,", name)
+	rg.w.Writefmtln("\tname string, args *%s, opts ...pulumi.ResourceOption) (*%s, error) {", argsType, name)
+
+	// Ensure required arguments are present.
+	for _, prop := range rg.res.inprops {
+		if !prop.optional() {
+			rg.w.Writefmtln("\tif args == nil || args.%s == nil {", upperFirst(prop.name))
+			rg.w.Writefmtln("\t\treturn nil, errors.New(\"missing required argument '%s'\")", upperFirst(prop.name))
+			rg.w.Writefmtln("\t}")
+		}
+	}
+
+	// Produce the input map.
+	rg.w.Writefmtln("\tinputs := map[string]pulumi.Input{}")
+	hasDefault := make(map[*variable]bool)
+	for _, prop := range rg.res.inprops {
+		if defaultValue := rg.g.goDefaultValue(prop); defaultValue != "" {
+			hasDefault[prop] = true
+			rg.w.Writefmtln("\tinputs[\"%s\"] = %s", prop.name, defaultValue)
+		}
+	}
+	rg.w.Writefmtln("\tif args != nil {")
+	for _, prop := range rg.res.inprops {
+		rg.w.Writefmtln("\t\tif i := args.%s; i != nil { inputs[\"%s\"] = i%s }",
+			upperFirst(prop.name), prop.name, goOutputMethod(prop))
+	}
+	rg.w.Writefmtln("\t}")
+
+	// Finally make the call to registration.
+	rg.w.Writefmtln("\tvar resource %s", name)
+	rg.w.Writefmtln("\terr := ctx.RegisterResource(\"%s\", name, inputs, &resource, opts...)", rg.res.info.Tok)
+	rg.w.Writefmtln("\tif err != nil {")
+	rg.w.Writefmtln("\t\treturn nil, err")
+	rg.w.Writefmtln("\t}")
+	rg.w.Writefmtln("\treturn &resource, nil")
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+
+	// Emit a factory function that reads existing instances of this resource.
+	if !rg.res.IsProvider() {
+		stateType := rg.res.statet.name
+		rg.w.Writefmtln("// Get%[1]s gets an existing %[1]s resource's state with the given name, ID, and optional", name)
+		rg.w.Writefmtln("// state properties that are used to uniquely qualify the lookup (nil if not required).")
+		if rg.res.info.DeprecationMessage != "" {
+			rg.w.Writefmtln("// Deprecated: %s", rg.res.info.DeprecationMessage)
+		}
+		rg.w.Writefmtln("func Get%s(ctx *pulumi.Context,", name)
+		rg.w.Writefmtln("\tname string, id pulumi.IDInput, state *%s, opts ...pulumi.ResourceOption) (*%s, error) {",
+			stateType, name)
+		rg.w.Writefmtln("\tinputs := map[string]pulumi.Input{}")
+		rg.w.Writefmtln("\tif state != nil {")
+		for _, prop := range rg.res.outprops {
+			rg.w.Writefmtln("\t\tif i := state.%s; i != nil { inputs[\"%s\"] = i%s }",
+				upperFirst(prop.name), prop.name, goOutputMethod(prop))
+		}
+		rg.w.Writefmtln("\t}")
+		rg.w.Writefmtln("\tvar resource %s", name)
+		rg.w.Writefmtln("\terr := ctx.ReadResource(\"%s\", name, id, inputs, &resource, opts...)", rg.res.info.Tok)
+		rg.w.Writefmtln("\tif err != nil {")
+		rg.w.Writefmtln("\t\treturn nil, err")
+		rg.w.Writefmtln("\t}")
+		rg.w.Writefmtln("\treturn &resource, nil")
+		rg.w.Writefmtln("}")
+		rg.w.Writefmtln("")
+
+		// Emit the state type for get methods.
+		rg.generatePlainType(rg.res.statet, true)
+		rg.w.Writefmtln("")
+	}
+
+	// Emit the argument type for construction.
+	rg.generatePlainType(rg.res.argst, true)
+
+	return nil
+}
+
+func (rg *goResourceGenerator) generateDatasourceFunc() error {
+	// Ensure that we've emitted any custom imports pertaining to any of the field types.
+	var fldinfos []*tfbridge.SchemaInfo
+	for _, fldinfo := range rg.fun.info.Fields {
+		fldinfos = append(fldinfos, fldinfo)
+	}
+	if err := rg.g.emitCustomImports(rg.w, rg.mod, fldinfos); err != nil {
 		return err
 	}
 
 	// Write the TypeDoc/JSDoc for the data source function.
-	if fun.doc != "" {
-		g.emitDocComment(w, fun.doc, fun.docURL, "")
+	if rg.fun.doc != "" {
+		rg.g.emitDocComment(rg.w, rg.fun.doc, rg.fun.docURL, "")
 	}
 
-	if fun.info.DeprecationMessage != "" {
-		w.Writefmtln("// Deprecated: %s", fun.info.DeprecationMessage)
+	if rg.fun.info.DeprecationMessage != "" {
+		rg.w.Writefmtln("// Deprecated: %s", rg.fun.info.DeprecationMessage)
 	}
 
 	// If the function starts with New or Get, it will conflict; so rename them.
-	funname := upperFirst(fun.name)
+	funname := upperFirst(rg.fun.name)
 	if strings.Index(funname, "New") == 0 {
 		funname = "Create" + funname[3:]
 	} else if strings.Index(funname, "Get") == 0 {
@@ -602,69 +790,244 @@ func (g *goGenerator) emitResourceFunc(mod *module, fun *resourceFunc) error {
 
 	// Now, emit the function signature.
 	argsig := "ctx *pulumi.Context"
-	if fun.argst != nil {
-		argsig = fmt.Sprintf("%s, args *%s", argsig, fun.argst.name)
+	if rg.fun.argst != nil {
+		argsig = fmt.Sprintf("%s, args *%s", argsig, rg.fun.argst.name)
 	}
 	var retty string
-	if fun.retst == nil {
+	if rg.fun.retst == nil {
 		retty = "error"
 	} else {
-		retty = fmt.Sprintf("(*%s, error)", fun.retst.name)
+		retty = fmt.Sprintf("(*%s, error)", rg.fun.retst.name)
 	}
-	w.Writefmtln("func %s(%s) %s {", funname, argsig, retty)
+	rg.w.Writefmtln("func %s(%s, opts ...pulumi.InvokeOption) %s {", funname, argsig, retty)
 
 	// Make a map of inputs to pass to the runtime function.
 	var inputsVar string
-	if fun.argst == nil {
+	if rg.fun.argst == nil {
 		inputsVar = "nil"
 	} else {
-		inputsVar = "inputs"
-		w.Writefmtln("\tinputs := make(map[string]interface{})")
-		w.Writefmtln("\tif args != nil {")
-		for _, arg := range fun.args {
-			w.Writefmtln("\t\tinputs[\"%s\"] = args.%s", arg.name, upperFirst(arg.name))
-		}
-		w.Writefmtln("\t}")
+		inputsVar = "args"
 	}
 
 	// Now simply invoke the runtime function with the arguments.
-	var outputsVar string
-	if fun.retst == nil {
-		outputsVar = "_"
+	var outputsType string
+	if rg.fun.retst == nil {
+		outputsType = "struct{}"
 	} else {
-		outputsVar = "outputs"
+		outputsType = rg.fun.retst.name
 	}
-	w.Writefmtln("\t%s, err := ctx.Invoke(\"%s\", %s)", outputsVar, fun.info.Tok, inputsVar)
+	rg.w.Writefmtln("\tvar rv %s", outputsType)
+	rg.w.Writefmtln("\terr := ctx.Invoke(\"%s\", %s, &rv, opts...)", rg.fun.info.Tok, inputsVar)
 
-	if fun.retst == nil {
-		w.Writefmtln("\treturn err")
+	if rg.fun.retst == nil {
+		rg.w.Writefmtln("\treturn err")
 	} else {
 		// Check the error before proceeding.
-		w.Writefmtln("\tif err != nil {")
-		w.Writefmtln("\t\treturn nil, err")
-		w.Writefmtln("\t}")
+		rg.w.Writefmtln("\tif err != nil {")
+		rg.w.Writefmtln("\t\treturn nil, err")
+		rg.w.Writefmtln("\t}")
 
-		// Get the outputs and return the structure, awaiting each one and propagating any errors.
-		w.Writefmtln("\treturn &%s{", fun.retst.name)
-		for _, ret := range fun.rets {
-			// TODO: ideally, we would have some strong typing on these outputs.
-			w.Writefmtln("\t\t%s: outputs[\"%s\"],", upperFirst(ret.name), ret.name)
-		}
-		w.Writefmtln("\t}, nil")
+		// Return the result.
+		rg.w.Writefmtln("\treturn &rv, nil")
 	}
-	w.Writefmtln("}")
+	rg.w.Writefmtln("}")
 
 	// If there are argument and/or return types, emit them.
-	if fun.argst != nil {
-		w.Writefmtln("")
-		g.emitPlainOldType(w, fun.argst)
+	if rg.fun.argst != nil {
+		rg.w.Writefmtln("")
+		rg.generatePlainType(rg.fun.argst, false)
 	}
-	if fun.retst != nil {
-		w.Writefmtln("")
-		g.emitPlainOldType(w, fun.retst)
+	if rg.fun.retst != nil {
+		rg.w.Writefmtln("")
+		rg.generatePlainType(rg.fun.retst, false)
 	}
 
 	return nil
+}
+
+func (rg *goResourceGenerator) generatePlainType(typ *propertyType, inputProperties bool) {
+	contract.Assert(typ.kind == kindObject)
+
+	if typ.doc != "" {
+		rg.g.emitDocComment(rg.w, typ.doc, "", "")
+	}
+	rg.w.Writefmtln("type %s struct {", typ.name)
+	for _, prop := range typ.properties {
+		if prop.doc != "" && prop.doc != elidedDocComment {
+			rg.g.emitDocComment(rg.w, prop.doc, prop.docURL, "\t")
+		} else if prop.rawdoc != "" {
+			rg.g.emitRawDocComment(rg.w, prop.rawdoc, "\t")
+		}
+
+		var typ string
+		if inputProperties {
+			typ = goInputPropertyType(prop)
+		} else {
+			typ = goPlainPropertyType(prop)
+		}
+
+		rg.w.Writefmtln("\t%s %s `pulumi:\"%s\"`", upperFirst(prop.name), typ, prop.name)
+	}
+	rg.w.Writefmtln("}")
+}
+
+func (rg *goResourceGenerator) generateInputType(typ *propertyType) {
+	// Generate the input interface.
+	rg.w.Writefmtln("type %sInput interface {", typ.name)
+	rg.w.Writefmtln("\tpulumi.Input")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("\tTo%sOutput() %sOutput", typ.name, typ.name)
+	rg.w.Writefmtln("\tTo%sOutputWithContext(ctx context.Context) %sOutput", typ.name, typ.name)
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+
+	if typ.doc != "" {
+		rg.g.emitDocComment(rg.w, typ.doc, "", "")
+	}
+	switch typ.kind {
+	case kindSet, kindList:
+		rg.w.Writefmtln("type %sArgs []%s", typ.name, goInputType(typ.element))
+	case kindMap:
+		rg.w.Writefmtln("type %sArgs map[string]%s", typ.name, goInputType(typ.element))
+	default:
+		rg.w.Writefmtln("type %sArgs struct {", typ.name)
+		for _, prop := range typ.properties {
+			if prop.doc != "" && prop.doc != elidedDocComment {
+				rg.g.emitDocComment(rg.w, prop.doc, prop.docURL, "\t")
+			} else if prop.rawdoc != "" {
+				rg.g.emitRawDocComment(rg.w, prop.rawdoc, "\t")
+			}
+
+			rg.w.Writefmtln("\t%s %s `pulumi:\"%s\"`", upperFirst(prop.name), goInputPropertyType(prop), prop.name)
+		}
+		rg.w.Writefmtln("}")
+	}
+	rg.w.Writefmtln("")
+
+	// Generate the implementation of the input interface.
+	rg.w.Writefmtln("func (%sArgs) ElementType() reflect.Type {", typ.name)
+	rg.w.Writefmtln("\treturn %sType", lowerFirst(typ.name))
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("func (a %sArgs) To%sOutput() %sOutput {", typ.name, typ.name, typ.name)
+	rg.w.Writefmtln("\treturn pulumi.ToOutput(a).(%sOutput)", typ.name)
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("func (a %sArgs) To%sOutputWithContext(ctx context.Context) %sOutput {", typ.name, typ.name, typ.name)
+	rg.w.Writefmtln("\treturn pulumi.ToOutputWithContext(ctx, a).(%sOutput)", typ.name)
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+}
+
+func (rg *goResourceGenerator) generateOutputType(typ *propertyType) {
+	if typ.doc != "" {
+		rg.g.emitDocComment(rg.w, typ.doc, "", "")
+	}
+
+	rg.w.Writefmtln("type %sOutput struct { *pulumi.OutputState }", typ.name)
+	rg.w.Writefmtln("")
+
+	// Note: this is the germ of an idea that may reshape the way we do inputs and outputs. Inputs
+	// would be things that are deeply inputty (i.e. only primitives may be resolved values);
+	// input interfaces for complex types would declare len/index methods and property accessors; all
+	// types on those accessors would be output types. This adds some implementation complexity, but
+	// may bring with it more clarity and flexibility. It also makes up for the lack of lifted property
+	// accesses somewhat.
+
+	switch typ.kind {
+	case kindSet, kindList:
+		rg.w.Writefmtln("func (o %sOutput) Index(i pulumi.IntInput) %s {", typ.name, goOutputType(typ.element))
+		rg.w.Writefmtln("\treturn pulumi.All(o, i).Apply(func(vs []interface{}) %s {", goPlainType(typ.element))
+		rg.w.Writefmtln("\t\treturn vs[0].(%s)[vs[1].(int)]", goPlainType(typ))
+		rg.w.Writefmtln("\t}).(%s)", goOutputType(typ.element))
+		rg.w.Writefmtln("}")
+	case kindMap:
+		// TODO(pdg): tuple-typed output?
+		rg.w.Writefmtln("func (o %sOutput) MapIndex(k pulumi.StringInput) %s {", typ.name, goOutputType(typ.element))
+		rg.w.Writefmtln("\treturn pulumi.All(o, k).Apply(func(vs []interface{}) %s {", goPlainType(typ.element))
+		rg.w.Writefmtln("\t\treturn vs[0].(%s)[vs[1].(string)]", goPlainType(typ))
+		rg.w.Writefmtln("\t}).(%s)", goOutputType(typ.element))
+		rg.w.Writefmtln("}")
+	default:
+		for i, prop := range typ.properties {
+			if i > 0 {
+				rg.w.Writefmtln("")
+			}
+
+			if prop.doc != "" && prop.doc != elidedDocComment {
+				rg.g.emitDocComment(rg.w, prop.doc, prop.docURL, "")
+			} else if prop.rawdoc != "" {
+				rg.g.emitRawDocComment(rg.w, prop.rawdoc, "")
+			}
+			rg.w.Writefmtln("func (o %sOutput) %s() %s {", typ.name, upperFirst(prop.name), goOutputPropertyType(prop))
+			rg.w.Writefmtln("\treturn o.Apply(func(v %s) %s {", goPlainType(typ), goPlainType(prop.typ))
+			if prop.optional() {
+				rg.w.Writefmtln("\t\tif v.%[1]s == nil { return *new(%s) } else { return *v.%[1]s }",
+					upperFirst(prop.name), goPlainType(prop.typ))
+			} else {
+				rg.w.Writefmtln("\t\treturn v.%s", upperFirst(prop.name))
+			}
+			rg.w.Writefmtln("\t}).(%s)", goOutputPropertyType(prop))
+			rg.w.Writefmtln("}")
+		}
+	}
+	rg.w.Writefmtln("")
+
+	// Generate the implementation of the input interface.
+	rg.w.Writefmtln("func (%sOutput) ElementType() reflect.Type {", typ.name)
+	rg.w.Writefmtln("\treturn %sType", lowerFirst(typ.name))
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("func (o %[1]sOutput) To%[1]sOutput() %[1]sOutput {", typ.name)
+	rg.w.Writefmtln("\treturn o")
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("func (o %[1]sOutput) To%[1]sOutputWithContext(ctx context.Context) %[1]sOutput {", typ.name)
+	rg.w.Writefmtln("\treturn o")
+	rg.w.Writefmtln("}")
+	rg.w.Writefmtln("")
+	rg.w.Writefmtln("func init() { pulumi.RegisterOutputType(%sOutput{}) }", typ.name)
+	rg.w.Writefmtln("")
+}
+
+func (rg *goResourceGenerator) generateNestedTypes() {
+	sort.Slice(rg.nested, func(i, j int) bool {
+		a, b := rg.nested[i], rg.nested[j]
+		return a.typ.name < b.typ.name
+	})
+
+	for _, nt := range rg.nested {
+		contract.Assert(nt.declarer == rg.res || nt.declarer == rg.fun)
+		contract.Assert(nt.kinds&goKindPlain != 0)
+
+		if nt.typ.kind == kindObject {
+			rg.generatePlainType(nt.typ, false)
+		}
+
+		if nt.kinds&(goKindInput|goKindOutput) != 0 {
+			rg.w.Writefmtln("var %sType = reflect.TypeOf((*%s)(nil)).Elem()", lowerFirst(nt.typ.name),
+				goPlainType(nt.typ))
+			rg.w.Writefmtln("")
+		}
+
+		if nt.kinds&goKindInput != 0 {
+			rg.generateInputType(nt.typ)
+		}
+		if nt.kinds&goKindOutput != 0 {
+			rg.generateOutputType(nt.typ)
+		}
+	}
+}
+
+//nolint:lll
+func (g *goGenerator) emitResourceType(mod *module, res *resourceType, nested *goNestedTypes) error {
+	rg := newGoResourceGenerator(g, mod, res, nested)
+	return rg.emit()
+}
+
+func (g *goGenerator) emitResourceFunc(mod *module, fun *resourceFunc, nested *goNestedTypes) error {
+	rg := newGoDatasourceGenerator(g, mod, fun, nested)
+	return rg.emit()
 }
 
 // emitOverlay copies an overlay from its source to the target, and returns the resulting file to be exported.
@@ -692,48 +1055,132 @@ func (g *goGenerator) emitCustomImports(w *tools.GenWriter, mod *module, infos [
 	return nil
 }
 
-// goOutputType returns the Go output type name for a resource property.
-func goOutputType(v *variable) string {
-	return goSchemaOutputType(v.schema, v.info)
+// goPlainType returns the Go plain type name for a resource property.
+func goPlainPropertyType(v *variable) string {
+	typ := goPlainType(v.typ)
+	if v.optional() {
+		typ = "*" + typ
+	}
+	return typ
 }
 
-const defaultGoOutType = "pulumi.Output"
-
-// goSchemaOutputType returns the Go output type name for a given Terraform schema and bridge override info.
-func goSchemaOutputType(sch *schema.Schema, info *tfbridge.SchemaInfo) string {
-	if sch != nil {
-		switch sch.Type {
-		case schema.TypeBool:
-			return "pulumi.BoolOutput"
-		case schema.TypeInt:
-			return "pulumi.IntOutput"
-		case schema.TypeFloat:
-			return "pulumi.Float64Output"
-		case schema.TypeString:
-			return "pulumi.StringOutput"
-		case schema.TypeSet, schema.TypeList:
-			if tfbridge.IsMaxItemsOne(sch, info) {
-				if elemSch, ok := sch.Elem.(*schema.Schema); ok {
-					var elemInfo *tfbridge.SchemaInfo
-					if info != nil {
-						elemInfo = info.Elem
-					}
-					return goSchemaOutputType(elemSch, elemInfo)
-				}
-				return goSchemaOutputType(nil, nil)
-			}
-			return "pulumi.ArrayOutput"
-		case schema.TypeMap:
-			// If this map has a "resource" element type, just use the generated element type. This works around a bug
-			// in TF that effectively forces this behavior.
-			if _, hasResourceElem := sch.Elem.(*schema.Resource); hasResourceElem {
-				return goSchemaOutputType(nil, nil)
-			}
-			return "pulumi.MapOutput"
+// goPlainType returns the Go plain type name for a given Terraform schema and bridge override info.
+func goPlainType(typ *propertyType) string {
+	// Prefer overrides over the underlying type.
+	switch {
+	case typ == nil:
+		return "interface{}"
+	case typ.asset != nil:
+		if typ.asset.IsArchive() {
+			return fmt.Sprintf("pulumi.%s", typ.asset.Type())
 		}
+		return "pulumi.AssetOrArchive"
 	}
 
-	return defaultGoOutType
+	// First figure out the raw type.
+	switch typ.kind {
+	case kindBool:
+		return "bool"
+	case kindInt:
+		return "int"
+	case kindFloat:
+		return "float64"
+	case kindString:
+		return "string"
+	case kindSet, kindList:
+		return "[]" + goPlainType(typ.element)
+	case kindMap:
+		if typ.element == nil {
+			return "map[string]string"
+		}
+		return "map[string]" + goPlainType(typ.element)
+	case kindObject:
+		return typ.name
+	default:
+		contract.Failf("Unrecognized type kind: %v", typ.kind)
+		return ""
+	}
+}
+
+// goElementType returns the Go element input or output type for a resource property type.
+func goElementType(typ *propertyType) string {
+	switch {
+	case typ == nil:
+		return "pulumi."
+	case typ.asset != nil:
+		if typ.asset.IsArchive() {
+			return "pulumi." + typ.asset.Type()
+		}
+		return "pulumi.AssetOrArchive"
+	}
+
+	switch typ.kind {
+	case kindBool:
+		return "pulumi.Bool"
+	case kindInt:
+		return "pulumi.Int"
+	case kindFloat:
+		return "pulumi.Float64"
+	case kindString:
+		return "pulumi.String"
+	case kindSet, kindList, kindMap:
+		return "pulumi."
+	case kindObject:
+		return typ.name
+	default:
+		contract.Failf("Unrecognized schema type: %v", typ.kind)
+		return ""
+	}
+}
+
+// goInputPropertyType returns the Go input type name for a resource property.
+func goInputPropertyType(v *variable) string {
+	return goInputType(v.typ)
+}
+
+// goInputType returns the Go input type name for a given type.
+func goInputType(typ *propertyType) string {
+	t := goElementType(typ)
+
+	switch typ.kind {
+	case kindSet, kindList:
+		return fmt.Sprintf("%sArrayInput", goElementType(typ.element))
+	case kindMap:
+		return fmt.Sprintf("%sMapInput", goElementType(typ.element))
+	}
+
+	return fmt.Sprintf("%sInput", t)
+}
+
+// goOutputPropertyType returns the Go output type name for a resource property.
+func goOutputPropertyType(v *variable) string {
+	return goOutputType(v.typ)
+}
+
+// goOutputType returns the Go output type name for a given Terraform schema and bridge override info.
+func goOutputType(typ *propertyType) string {
+	t := goElementType(typ)
+
+	switch typ.kind {
+	case kindSet, kindList:
+		return fmt.Sprintf("%sArrayOutput", goElementType(typ.element))
+	case kindMap:
+		return fmt.Sprintf("%sMapOutput", goElementType(typ.element))
+	}
+
+	if t == "pulumi." {
+		t = "pulumi.Any"
+	}
+	return fmt.Sprintf("%sOutput", t)
+}
+
+// goOutputMethod returns the "To*Output()" method for a given property.
+func goOutputMethod(v *variable) string {
+	t := goOutputPropertyType(v)
+	if t == "pulumi.AnyOutput" {
+		return ""
+	}
+	return fmt.Sprintf(".To%s()", strings.TrimPrefix(t, "pulumi."))
 }
 
 func goPrimitiveValue(value interface{}) (string, error) {
@@ -805,5 +1252,8 @@ func (g *goGenerator) goDefaultValue(v *variable) string {
 		defaultValue += ")"
 	}
 
-	return defaultValue
+	if defaultValue == "" {
+		return ""
+	}
+	return fmt.Sprintf("pulumi.Any(%s)", defaultValue)
 }
