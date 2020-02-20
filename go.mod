@@ -35,4 +35,7 @@ require (
 	google.golang.org/grpc v1.24.0
 )
 
-replace github.com/Azure/go-autorest => github.com/Azure/go-autorest v12.4.3+incompatible
+replace (
+	github.com/Azure/go-autorest => github.com/Azure/go-autorest v12.4.3+incompatible
+	github.com/pulumi/pulumi => /Users/justin/go/src/github.com/pulumi/pulumi
+)
