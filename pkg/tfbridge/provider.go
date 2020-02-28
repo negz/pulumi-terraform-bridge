@@ -1073,3 +1073,7 @@ func (p *ProviderInfo) RenameDataSource(resourceName string, legacyTok tokens.Mo
 	p.DataSources[legacyResourceName] = &legacyInfo
 	p.P.DataSourcesMap[legacyResourceName] = p.P.DataSourcesMap[resourceName]
 }
+
+func (p *Provider) GetSchema(ctx context.Context, req *pulumirpc.GetSchemaRequest) (*pulumirpc.GetSchemaResponse, error) {
+	return nil, nil
+}
